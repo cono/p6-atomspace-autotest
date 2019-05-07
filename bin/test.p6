@@ -6,6 +6,7 @@ use Cro::HTTP::Client;
 class Runner {
     has $.github;
     has $.name;
+    has $!container-name;
 
     has %.stats;
 
@@ -51,31 +52,33 @@ class Runner {
         return $supply;
     }
 
-    method start {
+    method start(:$clone) {
         start {
             my $cwd = $*TMPDIR.add($!name);
 
-            if $cwd.e {
-                self!rm-rf($cwd);
-                self!format("rm -rf $cwd", :good).say;
-            }
+            if ?$clone || !$cwd.add('.git').e {
+                if $cwd.e {
+                    self!rm-rf($cwd);
+                    self!format("rm -rf $cwd", :good).say;
+                }
 
-            $cwd.mkdir;
-            self!format("mkdir $cwd", :good).say;
+                $cwd.mkdir;
+                self!format("mkdir $cwd", :good).say;
 
-            my $proc = Proc::Async.new: :r, 'git', 'clone', $!github, $cwd;
+                my $proc = Proc::Async.new: :r, 'git', 'clone', $!github, $cwd;
 
-            $proc.stdout.tap(-> $line {
-                self!stdout($line.chomp).say;
-            });
+                $proc.stdout.tap(-> $line {
+                    self!stdout($line.chomp).say;
+                });
 
-            $proc.stderr.tap(-> $line {
-                self!stderr($line.chomp).say;
-            });
+                $proc.stderr.tap(-> $line {
+                    self!stderr($line.chomp).say;
+                });
 
-            self!format("git clone $!github $cwd", :good).say;
-            with await $proc.start {
-                self!format(.exitcode.fmt("git clone finished with %d exitcode"), good => .exitcode == 0).say;
+                self!format("git clone $!github $cwd", :good).say;
+                with await $proc.start {
+                    self!format(.exitcode.fmt("git clone finished with %d exitcode"), good => .exitcode == 0).say;
+                }
             }
 
             unless $cwd.add('Dockerfile').e {
@@ -141,6 +144,9 @@ class Runner {
             self!format("docker inspect atomspace/$!name .", :good).say;
             with await $docker-inspect.start(:$cwd) {
                 self!format(.exitcode.fmt("docker inspect finished with %d exitcode"), good => .exitcode == 0).say;
+
+                # to be able to cleanup
+                $!container-name = $container-name;
             }
 
             my $client = Cro::HTTP::Client.new(base-uri => "http://{$host}:8080");
@@ -169,7 +175,16 @@ class Runner {
 
             %!stats<healthcheck> = $json<status> eq 'UP';
 
-            my $docker-kill = Proc::Async.new: :r, 'docker', 'kill', $container-name;
+            %!stats<name> = $!name;
+            %!stats;
+        }
+    }
+
+    method cleanup {
+        start {
+            return unless $!container-name;
+
+            my $docker-kill = Proc::Async.new: :r, 'docker', 'kill', $!container-name;
 
             $docker-kill.stdout.lines(:chomp).tap(-> $line {
                 self!stdout($line).say;
@@ -179,39 +194,38 @@ class Runner {
                 self!stderr($line).say;
             });
 
-            self!format("docker kill $container-name", :good).say;
-            with await $docker-kill.start(:$cwd) {
+            self!format("docker kill $!container-name", :good).say;
+            with await $docker-kill.start {
                 self!format(.exitcode.fmt("docker kill finished with %d exitcode"), good => .exitcode == 0).say;
 
                 if so .exitcode {
                     die "$!name not able to kill Docker container" if so .exitcode;
                 }
             }
-
-            %!stats<name> = $!name;
-
-            %!stats;
         }
     }
 }
 
-sub MAIN(Str :$repo-list) {
+sub MAIN(Str :$repo-list, Bool :$clone) {
     my @workers;
 
     for $repo-list.IO.lines -> $line {
         next if $line ~~ / ^^ '#' /;
 
         with $line ~~ / 'github.com/' $<name> = <-[/]>+ / {
-            @workers.push: Runner.new(github => $line, name => $<name>).start;
+            @workers.push: Runner.new(github => $line, name => $<name>);
         }
     }
 
-    await Promise.allof(@workers);
+    my @started = @workers».start(:$clone);
+    await Promise.allof(@started);
 
-    for @workers -> $p {
+    for @started -> $p {
         when $p.status eq 'Broken' {
             "Error: {$p.cause.message}".say;
         }
         $p.result.say;
     }
+
+    await Promise.allof(@workers».cleanup);
 }
