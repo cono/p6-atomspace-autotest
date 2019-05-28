@@ -52,6 +52,56 @@ class Runner {
         return $supply;
     }
 
+    method !do-request($client, $equation) {
+        my $promise-result = Promise.new;
+        my $result = $promise-result.vow;
+
+        my $promise = $client.post: '/calc',
+            content-type => 'application/json',
+            body => { :$equation, };
+
+        $promise.then({
+            # promise kept by timeout, just get out of here
+            return if $result.promise.status ~~ Kept;
+
+            .result.body.then({
+                with .result {
+                    my %h =
+                        result => .<result>,
+                        is-equ-returned => $equation eq .<equation>;
+                    $result.keep(%h);
+                }
+            });
+            CATCH {
+                when X::Cro::HTTP::Error {
+                    if .response.status == 400 {
+                        .response.body.then({
+                            with .result {
+                                my %h =
+                                    result          => 'error',
+                                    msg             => .<error>,
+                                    is-equ-returned => .<equation> eq $equation;
+                                $result.keep(%h);
+                            }
+                        });
+                    } else {
+                        $result.keep(%{result => 'error'});
+                    }
+                }
+                default {
+                    $result.keep(%{result => 'error'});
+                }
+            }
+        });
+
+        Promise.in(5).then({
+            $result.keep(%{result => 'timeout'}) unless $result.promise.status ~~ Kept;
+        });
+
+        return $promise-result;
+
+    }
+
     method start(:$clone) {
         start {
             my $cwd = $*TMPDIR.add($!name);
@@ -173,7 +223,51 @@ class Runner {
             };
             my $json = await $healthcheck.body;
 
-            %!stats<healthcheck> = $json<status> eq 'UP';
+            %!stats<tests><healthcheck> = $json<status> eq 'UP';
+
+            my @test-cases =
+                %{ result => 'error',  equation => '(2 + 2) + ('},
+                %{ result => '1',      equation => '1/2 + 1/2' },
+                %{ result => '5/6',    equation => '1/2 + 1/3' },
+                %{ result => '2',      equation => '(((4/2)))' },
+                %{ result => 'error',  equation => '1 2' },
+                %{ result => 'error',  equation => '(1' },
+                %{ result => 'error',  equation => '(1))' },
+                %{ result => 'error',  equation => '((1)' },
+                %{ result => 'error',  equation => '1 + 2 3 / 4' },
+                %{ result => '7/6',    equation => '1/2 + 2/3' },
+                %{ result => '3/4',    equation => '(3/6) / (2/3)' },
+                %{ result => '-47/42', equation => '(1/2 + 2/3) - ((2/7) / (1/8))' },
+                %{ result => '3/2',    equation => '1 + 1/2' },
+                %{ result => '1/9',    equation => '((2/3) * (1/6))' },
+                %{ result => '3/8',    equation => '1/(2/(3/(4)))' };
+
+
+            @test-cases.push(%{ result => 3000, equation => ("1/2" xx 6000).join("+"), name => "long" });
+
+            for @test-cases -> $test {
+                $test<promise> = self!do-request($client, $test<equation>);
+            }
+
+            await Promise.allof(@test-cases.map: *<promise>);
+
+            my $equation-returned-count = 0;
+            my $error-message-count = 0;
+            for @test-cases -> $test {
+                with $test<promise>.result {
+                    my $name = $test<name> // $test<equation>;
+                    %!stats<tests>{$name} = $test<result> eq .<result> ?? '+' !! '-';
+                    %!stats<tests>{$name} = 'T' if .<result> eq 'timeout';
+
+                    if .<result> eq 'error' && so .<msg> {
+                        $error-message-count++;
+                    }
+                    $equation-returned-count++ if .<is-equ-returned>;
+                }
+            }
+
+            %!stats<tests><equation-returned> = @test-cases.elems == $equation-returned-count;
+            %!stats<tests><error-messages> = @test-cases.grep(*<result> eq 'error').elems == $error-message-count;
 
             %!stats<name> = $!name;
             %!stats;
@@ -206,26 +300,36 @@ class Runner {
     }
 }
 
-sub MAIN(Str :$repo-list, Bool :$clone) {
+sub MAIN(Str :$repo-list!, Bool :$clone) {
     my @workers;
 
     for $repo-list.IO.lines -> $line {
         next if $line ~~ / ^^ '#' /;
 
         with $line ~~ / 'github.com/' $<name> = <-[/]>+ / {
-            @workers.push: Runner.new(github => $line, name => $<name>);
+            @workers.push: Runner.new(github => $line, name => ~$<name>);
         }
     }
 
     my @started = @workers».start(:$clone);
     await Promise.allof(@started);
 
+    my %data;
     for @started -> $p {
         when $p.status eq 'Broken' {
             "Error: {$p.cause.message}".say;
         }
-        $p.result.say;
+        with $p.result {
+            %data{.<name>} = .<tests>;
+        }
     }
 
     await Promise.allof(@workers».cleanup);
+
+    my @names = %data.keys.sort;
+    say "test-name|" ~ @names.join("|");
+
+    for %data<cono>.keys -> $k {
+        say "$k|" ~ @names.map({ %data{$_}{$k} }).map({ qw/+ - T/.first(* eq $_) ?? $_ !! $_ ?? '+' !! '-' }).join("|");
+    }
 }
