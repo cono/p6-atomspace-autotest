@@ -1,7 +1,7 @@
 https://github.com/cono/p6-math-fractioncalculator.git
-https://github.com/STih07/simple-fraction-calculator.git
+#https://github.com/STih07/simple-fraction-calculator.git
 https://github.com/ZorgikGT/Fraction-Calculator.git
 https://github.com/Kal1na-w/FractionCalculator.git
-https://github.com/kyrylich/fraction-calculator.git
+#https://github.com/kyrylich/fraction-calculator.git
 #https://github.com/zahessi/fraction-calculator.git
 #https://github.com/AnniePerederii/FractionsCalculator.git
